@@ -7,6 +7,7 @@ const {
     extractSubcatPage,
     enqueueNextPages,
     extractProductPage,
+    extractProductVariants,
 } = require('./extractors');
 
 const {
@@ -58,15 +59,14 @@ Apify.main(async () => {
         handlePageTimeoutSecs: 240,
         requestTimeoutSecs: 120,
         proxyUrls,
+        additionalMimeTypes: [ 'application/json' ], // So we can process JSON responses
 
-        handlePageFunction: async ({ request, body, $ }) => {
+        handlePageFunction: async ({ request, body, $, json }) => {
             // if exists, check items limit. If limit is reached crawler will exit.
             if (maxItems) maxItemsCheck(maxItems, itemCount);
 
             log.info('Processing:', request.url);
             const { label } = request.userData;
-
-            //
 
             if (label === 'HOMEPAGE') {
                 const totalEnqueued = await enqueueSubcategories($, requestQueue);
@@ -84,27 +84,52 @@ Apify.main(async () => {
             if (label === 'SUBCAT') {
                 const { urls, totalPages } = await extractSubcatPage($);
 
-                const isPageOne = !(request.url.split('#')[1]);
+                const url = new URL(request.url);
+                const isPageOne = url.searchParams.query === undefined || url.searchParams.get('start') === 0
 
-                if (isPageOne) {
-                    await enqueueNextPages(request, requestQueue, totalPages);
-                }
-
-                // enqueue products of the current page
+                //if (isPageOne && totalPages > 1) {
+                //    await enqueueNextPages($, requestQueue, totalPages);
+                //}
+ 
                 for (const url of urls) {
                     if (url) {
                         await requestQueue.addRequest({
                             url,
                             userData: { label: 'PRODUCT' },
                         });
+                        break; // XXX
                     }
                 }
 
-                log.info(`Added ${urls.length} products from ${request.url}`);
+                log.info(`Enqueued ${urls.length} products from ${request.url}`);
             }
 
             if (label === 'PRODUCT') {
-                let items = await extractProductPage($, request);
+                let product = await extractProductPage($, request);
+                let product_id = request.url.match(/(\d+)\.html/)[1];
+
+                // Send out XHR request to get the images for variants
+                const variant_url = new URL('https://www.forever21.com/on/demandware.store/Sites-forever21-Site/en_US/Product-Variation');
+                variant_url.search = new URLSearchParams({ pid: product_id });
+
+                await requestQueue.addRequest({
+                    method: 'GET',
+                    url: variant_url.href,
+                    headers: {
+                        'x-requested-with': 'XMLHttpRequest',
+                        Accept: 'application/json' 
+                    },
+                    userData: { 
+                        label: 'PRODUCT-VARIANTS',
+                        product: product
+                    }
+                });
+
+                log.info(`Enqueued product variant from ${request.url}`);
+            }
+
+            if (label === 'PRODUCT-VARIANTS') {                
+                let items = await extractProductVariants(json, request);
 
                 if (extendOutputFunction) items = await applyFunction($, evaledFunc, items);
 

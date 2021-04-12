@@ -1,22 +1,24 @@
 const Apify = require('apify');
 
 const { log } = Apify.utils;
+const { URL } = require('url');
 const cheerio = require('cheerio');
-
+const fetch = require("node-fetch");
 const { BASE_URL } = require('./constants');
 
 async function enqueueSubcategories($, requestQueue, cat = null) {
-    let menuCats = $('div.d_new_mega_menu').toArray();
+    let menuCats = $('ul[role="menu"] > li[role="menuitem"]').toArray();
     let totalEnqueued = 0;
 
     // if this function is used to extract subcategories from single main cat,
     // keep only the single relevant div
     if (cat) {
-        menuCats = menuCats.filter(menuDiv => $(menuDiv).children().first().attr('href') === cat);
+        log.info(`Only keeping subcategories from category ${cat}.`);
+        menuCats = menuCats.filter(menuLi => $(menuLi).children().first().attr('href') === cat);
     }
 
-    for (const menuDiv of menuCats) {
-        const hrefs = $(menuDiv).find('a').toArray().map(a => a.attribs.href);
+    for (const li of menuCats) {
+        const hrefs = $(li).find('a').toArray().map(a => a.attribs.href);
 
         // filter out unsupported categories
         const supportedHrefs = hrefs.filter((href) => {
@@ -30,9 +32,10 @@ async function enqueueSubcategories($, requestQueue, cat = null) {
 
         for (const href of supportedHrefs) {
             await requestQueue.addRequest({
-                url: BASE_URL + href,
+                url: new URL(href, BASE_URL).href,
                 userData: { label: 'SUBCAT' },
             });
+            break; //XXX
         }
     }
 
@@ -46,89 +49,107 @@ async function enqueueSubcategories($, requestQueue, cat = null) {
 }
 
 async function extractSubcatPage($) {
-    const scriptContent = $('script:contains("var cData")').html();
-    const start = scriptContent.indexOf('var cData = ');
-    const end = scriptContent.indexOf('console.log(cData);');
-    const dataString = scriptContent.substring(start, end);
+    const totalRecordsText = $('span[data-search-component="product-search-count"]').text().trim();
+    const totalRecords = Number( totalRecordsText.match(/(\d+)\s+Products/)[1] );
+    
+    const jsonLD = $('script[type="application/ld+json"]');
+    const items = JSON.parse(jsonLD.html());
 
-    const cData = JSON.parse(dataString.replace('var cData = ', '').substring(0, dataString.indexOf('};')).trim().slice(0, -1));
-    const catalogProducts = cData.CatalogProducts;
-    const totalRecords = cData.TotalRecords;
-    if (!catalogProducts || !totalRecords) {
-    // console.log(cData);
-        throw new Error('Web page missing critical data source');
-    }
-    // log.info('length of catalogProducts: ' + catalogProducts.length + '. TotalRecords: ' + totalRecords);
-
-    const urls = catalogProducts.map(item => item.ProductShareLinkUrl.toLowerCase());
-    const totalPages = Math.ceil(totalRecords / 120);
+    const urls = items.itemListElement.map(e => e.url);
+    const totalPages = Math.ceil(totalRecords / 60);
 
     return { urls, totalPages };
 }
 
-async function enqueueNextPages(request, requestQueue, totalPages) {
-    const currentBaseUrl = request.url.split('#')[0];
+async function enqueueNextPages($, requestQueue, totalPages) {
+    const nextPageUrl = $('button[aria-label="View Page 2"]').attr('data-url');
+
+    // Eg. https://www.forever21.com/us/shop/catalog/category/21men/mens-tops?cgid=mens_tops&start=60&sz=60
+    const urlParts = new URL(nextPageUrl);
+    const nextPageStart = () => ( Number(urlParts.searchParams.get('start')) + 
+                                  Number(urlParts.searchParams.get('sz')) ).toString();
 
     // add all successive pages for this subcat
     for (let i = 2; i <= totalPages; i++) {
         const info = await requestQueue.addRequest({
-            url: `${currentBaseUrl}#pageno=${i}`,
-            keepUrlFragment: true,
+            url: urlParts.href,
             userData: { label: 'SUBCAT' },
         });
 
         log.info('Added', info.request.url);
+
+        urlParts.searchParams.set('start', nextPageStart() );
     }
 }
 
 async function extractProductPage($, request) {
-    const scriptContent = $('script:contains("var pData")').html();
+    const jsonLD = $('script[type="application/ld+json"]')
+    const schema = JSON.parse(jsonLD.html());
+
+    const scriptContent = $('script:contains("e_product_detail_loaded")').html();
     if (!scriptContent) throw new Error('Web page missing critical data source');
+    const productDetailRe = /dataLayer\.push\((.+)\);/s;
+    const productDetailText = scriptContent.match(productDetailRe)[1];
+    const productDetail = eval(`(${productDetailText})`).product;
+    const item = Object.create(null);
 
-    const start = scriptContent.indexOf('var pData = ') + 12;
-    const end = scriptContent.length;
+    item.source = 'forever21';
+    item.itemId = productDetail.id;
+    item.url = request.url;
+    item.scrapedAt = new Date().toISOString();
+    item.brand = productDetail.brand;
+    item.title = productDetail.name;
+    item.categories = schema.breadcrumb.map(bc => bc.name.toLowerCase()).filter(bc => bc !== item.title.toLowerCase());
+    item.price = productDetail.originalPrice;
+    item.salePrice = productDetail.price;
+    item.currency = schema.offers.priceCurrency;
 
-    let dataString = scriptContent.substr(start, end);
-    dataString = dataString.substr(0, dataString.indexOf('brand =')).trim();
-    dataString = dataString.substr(0, dataString.length - 1);
+    if (productDetail.variants.length === 1) {
+        item.color = productDetail.variants[0].colorName.toLowerCase();
+        item.sizes = productDetail.variants[0].sizes.map(obj => obj.sizeName);
+        item.availableSizes = productDetail.variants[0].sizes.filter(obj => obj.available === 'true').map(obj => obj.sizeName);
+        item.images = schema.image.map(url => ({ url: url.split('?')[0] }) );
+    } 
 
-    const parsedData = JSON.parse(dataString);
-    const jsonLDContent = cheerio.load(parsedData.CrawlableBreadCrumb)('script')[0].children[0].data;
-    const breadcrumbArray = JSON.parse(jsonLDContent).itemListElement;
-    const parsedDesc = cheerio.load(parsedData.Description);
-    const gseo = cheerio.load(parsedData.GSEO);
-    const variants = parsedData.Variants;
-    const imageBaseUrls = JSON.parse(gseo('script')[0].children[0].data).image.map(url =>
-        url.replace('https://', '').split('/').slice(0, -1).join('/')
-    );
+    return item;
+}
+
+async function extractProductVariants(json, request) {
+    const { product } = request.userData;
+    const variationAttributes = json.product.variationAttributes;
+    const variants = json.product.variants;
+    const colors = {};
+    const sizes = {};
+
+    for (const va of variationAttributes) {
+        if (va.attributeId === 'color') {
+            for (const v of va.values) {
+                colors[v.id] = { 
+                    name: v.displayValue,
+                    images: v.images.swatch.map(obj => ({ url: obj.url.split('?')[0] }) )
+                };
+            }
+        } else if (va.attributeId === 'size') {
+            for (const v of va.values) {
+                sizes[v.id] = v.displayValue;
+            }
+        }
+    }
 
     const items = [];
+    const parsedDesc = cheerio.load(json.product.longDescription);
 
     // create an item for each color
-    for (let i = 0; i < variants.length; i++) {
-        const item = Object.create(null);
+    for (const c of Object.keys(variants)) {
+        const item = JSON.parse(JSON.stringify(product));
 
-        item.source = 'forever21';
-        item.itemId = parsedData.ProductId;
-        item.url = request.url;
-        item.scrapedAt = new Date().toISOString();
-        item.brand = parsedData.Brand;
-        item.title = parsedData.DisplayName;
-        item.categories = breadcrumbArray.map(it => it.item.name.toLowerCase()).filter(it => it !== item.title.toLowerCase());
-        item.description = parsedDesc.text().replace(/^Details/, '');
+        item.description = parsedDesc.text().replace(/^Details/, '');;
         const descChip = item.description.substring(item.description.indexOf('Content + Care-')).replace('Content + Care- ', '');
         item.composition = descChip.substring(0, descChip.indexOf('-'));
-        item.price = variants[i].OriginalPrice;
-        item.salePrice = variants[i].ListPrice || parsedData.ListPrice;
-        item.currency = JSON.parse(gseo('script')[0].children[0].data).offers.priceCurrency;
-        const itemGender = parsedData.ProductSizeChart.toLowerCase();
-        item.gender = itemGender === 'women' ? 'female' : (itemGender === 'men' ? 'male' : null);
-        item.color = variants[i].ColorName.toLowerCase();
-        item.sizes = variants[i].Sizes.map(obj => obj.SizeName);
-        item.availableSizes = variants[i].Sizes.filter(obj => obj.Available).map(obj => obj.SizeName);
-        item.images = imageBaseUrls.map(baseurl => {
-            return { url: `https://${baseurl}/${parsedData.ItemCode}-${variants[i].ColorId}.jpg` };
-        });
+        item.color = colors[c].name.toLowerCase();
+        item.sizes = Object.keys(variants[c]).map(k => sizes[k]);
+        item.availableSizes = Object.keys(variants[c]).filter(k => variants[c][k].available).map(k => sizes[k]);
+        item.images = colors[c].images;
 
         items.push(item);
     }
@@ -141,4 +162,5 @@ module.exports = {
     extractSubcatPage,
     enqueueNextPages,
     extractProductPage,
+    extractProductVariants,
 };

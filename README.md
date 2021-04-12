@@ -25,10 +25,10 @@ INPUT Example:
 ```
 {
   "startUrls": [
-    "https://www.forever21.com/us/shop/catalog/category/f21/women-main",
-    "https://www.forever21.com/us/shop/catalog/category/plus/plus_size-activewear",
-    "https://www.forever21.com/us/shop/catalog/category/21men/mens-sweaters",
-    "https://www.forever21.com/us/shop/catalog/product/girls/girls_main/2000386827"
+    { "url": "https://www.forever21.com/us/shop/catalog/category/f21/women-main" },
+    { "url": "https://www.forever21.com/us/shop/catalog/category/plus/plus_size-activewear" },
+    { "url": "https://www.forever21.com/us/shop/catalog/category/21men/mens-sweaters" },
+    { "url": "https://www.forever21.com/us/shop/catalog/product/girls/girls_main/2000386827 }"
   ],
   "maxItems": 1000,
   "extendOutputFunction": "($) => { return { test: 1234, test2: 5678 } }",
